@@ -224,7 +224,14 @@ const CSS = `
 .weknora-inline .weknora-input { flex: 1; }
 .weknora-inline .weknora-hint { margin: 0; white-space: nowrap; }
 .weknora-status { display: flex; align-items: center; gap: 8px; height: 32px; font-size: 12.5px; color: var(--wk-fg-2); }
-.weknora-status .ok { width: 7px; height: 7px; border-radius: 999px; background: var(--wk-ok); flex: none; }
+/* The dot carries the verdict: green only for a listing that actually succeeded,
+   red for a failing one, grey while nothing is known yet. */
+.weknora-status .ok,
+.weknora-status .err,
+.weknora-status .idle { width: 7px; height: 7px; border-radius: 999px; flex: none; }
+.weknora-status .ok { background: var(--wk-ok); }
+.weknora-status .err { background: var(--wk-danger); }
+.weknora-status .idle { background: var(--wk-fg-4); }
 .weknora-secret { display: flex; align-items: center; gap: 8px; }
 .weknora-secret .val {
   flex: 1; height: 32px; display: flex; align-items: center; padding: 0 10px;

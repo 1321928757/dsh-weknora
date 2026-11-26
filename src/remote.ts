@@ -72,6 +72,10 @@ export interface ConfigStatusView {
   readonly enabledTools: string[]
   readonly knowledgeBaseCount: number
   readonly fetchedAt: number | undefined
+  /** True once a listing has succeeded at least once; false means the count is not evidence. */
+  readonly catalogWarm: boolean
+  /** Why the last listing failed, if it did — shown instead of a green "connected". */
+  readonly catalogError: string | undefined
   readonly hintWhenUnselected: boolean
   readonly effective: EffectiveConfigView
 }
@@ -186,7 +190,8 @@ export function createRemoteService(deps: RemoteDeps) {
 
     async testConnection(args: unknown): Promise<RemoteResult<{ latencyMs: number, knowledgeBaseCount: number }>> {
       const requested = field(args, 'baseUrl')
-      let baseUrl = live.current().baseUrl
+      const effective = live.current().baseUrl
+      let baseUrl = effective
       if (typeof requested === 'string' && requested.trim() !== '') {
         try {
           baseUrl = new URL(normalizeBaseUrl(requested)).toString().replace(/\/+$/, '')
@@ -199,21 +204,31 @@ export function createRemoteService(deps: RemoteDeps) {
       // The stored key only ever goes to the configured origin. Otherwise this one
       // call would hand the user's credential to any host a client names — the key
       // is written owner-only precisely so it cannot travel.
-      const sameOrigin = originOf(baseUrl) === originOf(live.current().baseUrl)
-      const apiKey = supplied ?? (sameOrigin ? await secrets.load() : undefined)
+      const stored = await secrets.load()
+      const sameOrigin = originOf(baseUrl) === originOf(effective)
+      const apiKey = supplied ?? (sameOrigin ? stored : undefined)
+      // An address the user typed but never saved is not the configured one, so a
+      // probe would go out anonymous and come back 401 — which reads as "your key
+      // is invalid" while the key is fine and simply not this address's to use.
+      // Name what is actually wrong instead of spending the round trip.
+      if (apiKey === undefined && !sameOrigin && stored !== undefined) {
+        return {
+          ok: false,
+          error: `服务地址还没生效（当前生效的是 ${effective}，测试用的是 ${baseUrl}）。`
+            + '已保存的 API Key 只会发给生效的服务地址，所以这次没有带 Key——后端回的 401 不是 Key 无效。'
+            + '点「保存并测试」把地址存下来再测；要单独测这个地址，请在「替换」里填入该部署的 Key。',
+        }
+      }
       const started = Date.now()
       try {
         const bases = await clientFor(baseUrl, apiKey).listKnowledgeBases(AbortSignal.timeout(10_000))
+        // A successful listing against the configured deployment is also the
+        // freshest catalog we can get for free, so the status row and the picker
+        // stop reporting a cold snapshot after a passing test.
+        if (sameOrigin) catalog.absorb(bases)
         return { ok: true, latencyMs: Date.now() - started, knowledgeBaseCount: bases.length }
       } catch (error) {
-        const reason = describeError(error)
-        if (supplied === undefined && !sameOrigin && /\b40[13]\b/.test(reason)) {
-          return {
-            ok: false,
-            error: `${reason}（该地址不是当前配置的服务地址，未转发已保存的 API Key；若要测它，请在上面填入该部署的 API Key）`,
-          }
-        }
-        return { ok: false, error: reason }
+        return { ok: false, error: describeError(error) }
       }
     },
 
@@ -235,6 +250,8 @@ export function createRemoteService(deps: RemoteDeps) {
           .map(([key]) => key),
         knowledgeBaseCount: catalog.ids().length,
         fetchedAt: catalog.fetchedAt,
+        catalogWarm: catalog.isWarm,
+        catalogError: catalog.lastError,
         hintWhenUnselected: config.hintWhenUnselected,
         effective: {
           baseUrl: config.baseUrl,

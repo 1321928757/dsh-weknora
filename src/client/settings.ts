@@ -42,6 +42,10 @@ interface StatusView {
   readonly baseUrl?: string
   readonly hasApiKey?: boolean
   readonly knowledgeBaseCount?: number
+  /** True once a listing has succeeded; without it the count is not a connection. */
+  readonly catalogWarm?: boolean
+  /** Why the last listing failed; shown instead of a green "connected". */
+  readonly catalogError?: string
   readonly hintWhenUnselected?: boolean
   readonly enabledTools?: string[]
   readonly effective?: EffectiveView
@@ -87,6 +91,26 @@ function toDraft(value: Record<string, unknown> | undefined, status: StatusView 
 const seconds = (value: string): number => Math.round(Number(value) * 1000)
 const isPositive = (value: string): boolean => /^\d+$/.test(value.trim()) && Number(value) > 0
 
+/**
+ * The host's `normalizeBaseUrl`, mirrored.
+ *
+ * The page needs it to tell "the address in force" from "an address typed but
+ * not saved yet": that is exactly the case where the host refuses to forward the
+ * stored key, so the button has to offer the save first instead of a test that
+ * can only fail. Kept deliberately dumb — the host still owns validation.
+ */
+function normalizedAddress(value: string): string {
+  const trimmed = value.trim().replace(/\/+$/, '')
+  if (trimmed === '') return ''
+  const withRoot = /\/api\/v\d+$/.test(trimmed) ? trimmed : `${trimmed}/api/v1`
+  try {
+    const url = new URL(withRoot)
+    return `${url.protocol}//${url.host}${url.pathname.replace(/\/+$/, '')}`
+  } catch {
+    return withRoot
+  }
+}
+
 export function createSettings(deps: SettingsDeps): unknown {
   const { call, i18n, ctx } = deps
   const t = i18n.t
@@ -119,6 +143,23 @@ export function createSettings(deps: SettingsDeps): unknown {
     const value = (snapshot?.value ?? {}) as Record<string, unknown>
 
     /**
+     * Re-read the effective configuration.
+     *
+     * The status row is only honest if it follows what the host actually has: a
+     * save can change the address in force, and a passing test warms the catalog
+     * the count comes from. A failed read keeps the last known status instead of
+     * pretending the plugin is unconfigured.
+     */
+    const refreshStatus = React.useCallback(async (): Promise<void> => {
+      try {
+        const result = await call<StatusView>('getConfigStatus')
+        if (result?.ok === true) setStatus(result)
+      } catch {
+        // Keep the previous status.
+      }
+    }, [call])
+
+    /**
      * True once the user has touched the draft. A re-seed from the persisted form
      * must not overwrite edits that are not saved yet — saving the API key bumps
      * `status.hasApiKey`, which used to silently restore the old service address.
@@ -136,10 +177,8 @@ export function createSettings(deps: SettingsDeps): unknown {
     }, [snapshot?.status, JSON.stringify(value), status?.hasApiKey])
 
     React.useEffect(() => {
-      void call<StatusView>('getConfigStatus').then(result => {
-        if (result?.ok === true) setStatus(result)
-      }).catch(() => undefined)
-    }, [call])
+      void refreshStatus()
+    }, [refreshStatus])
 
     const writable = snapshot?.writable !== false && typeof form?.set === 'function'
 
@@ -192,18 +231,19 @@ export function createSettings(deps: SettingsDeps): unknown {
       setDraft(current => ({ ...current, hintWhenUnselected: !current.hintWhenUnselected }))
     }
 
-    const save = async (): Promise<void> => {
+    /** @returns true only when the writes landed, so a caller can chain a test. */
+    const save = async (): Promise<boolean> => {
       const found = validate()
       setErrors(found)
       if (Object.keys(found).length > 0) {
         // The summary does not exist yet — it is rendered by this very update —
         // so the focus move is an effect, not a call.
         setRejects(previous => previous + 1)
-        return
+        return false
       }
       if (form?.set === undefined) {
         setMessage({ kind: 'err', text: t('settings.readonly') })
-        return
+        return false
       }
       setBusy(true)
       setMessage(undefined)
@@ -225,9 +265,13 @@ export function createSettings(deps: SettingsDeps): unknown {
           else await form.set(field, next)
         }
         dirtyRef.current = false
-      setMessage({ kind: 'ok', text: t('settings.saved') })
+        setMessage({ kind: 'ok', text: t('settings.saved') })
+        // The address in force just changed; the row and the button label read it.
+        await refreshStatus()
+        return true
       } catch (error) {
         setMessage({ kind: 'err', text: t('settings.error.saveFailed', { reason: String((error as Error)?.message ?? error) }) })
+        return false
       } finally {
         setBusy(false)
       }
@@ -243,12 +287,25 @@ export function createSettings(deps: SettingsDeps): unknown {
         )
         if (result?.ok !== true) throw new Error(result?.error ?? '')
         setMessage({ kind: 'ok', text: t('settings.status.connected', { ms: result.latencyMs ?? 0, n: result.knowledgeBaseCount ?? 0 }) })
-        setStatus(current => ({ ...(current ?? { ok: true }), knowledgeBaseCount: result.knowledgeBaseCount ?? 0 }))
+        // A passing test also warms the catalog snapshot the status row counts.
+        await refreshStatus()
       } catch (error) {
         setMessage({ kind: 'err', text: t('settings.error.testFailed', { reason: String((error as Error)?.message ?? error) }) })
       } finally {
         setBusy(false)
       }
+    }
+
+    /**
+     * Save the draft, then test it.
+     *
+     * The host only forwards the stored key to the address in force, so testing
+     * an unsaved address can only ever come back 401 — with a key that is fine.
+     * One click has to mean "put this address in force and tell me whether it
+     * answers", which is what the button in front of the user says it does.
+     */
+    const saveThenTest = async (): Promise<void> => {
+      if (await save()) await test()
     }
 
     /**
@@ -323,6 +380,34 @@ export function createSettings(deps: SettingsDeps): unknown {
 
     const errorCount = Object.keys(errors).length
 
+    /**
+     * The address in the field is not the one in force.
+     *
+     * Then a test can only fail: the host refuses to hand the stored key to an
+     * address it has never been configured with. The button says "save & test"
+     * so one click puts the address in force and then asks it.
+     */
+    const savedAddress = status?.effective?.baseUrl ?? status?.baseUrl ?? ''
+    const addressEdited = status !== undefined && normalizedAddress(draft.baseUrl) !== normalizedAddress(savedAddress)
+
+    /**
+     * What the status row may claim.
+     *
+     * A count alone is not a connection: before the first successful listing the
+     * catalog is empty, which used to render as a green "connected · 0 bases" on
+     * a plugin that had never reached anything.
+     */
+    const connection = ((): { state: 'ok' | 'err' | 'idle', text: string, reason?: string } => {
+      if (status === undefined) return { state: 'idle', text: t('settings.status.unknown') }
+      if (status.catalogError !== undefined) {
+        return { state: 'err', text: t('settings.status.failed'), reason: status.catalogError }
+      }
+      if (status.catalogWarm === true) {
+        return { state: 'ok', text: t('settings.status.bases', { n: status.knowledgeBaseCount ?? 0 }) }
+      }
+      return { state: 'idle', text: t('settings.status.unknown') }
+    })()
+
     return h('div', { className: 'weknora-root weknora-settings' },
       h('h2', null, t('settings.title')),
       h('p', { className: 'lede' }, t('settings.description')),
@@ -348,15 +433,19 @@ export function createSettings(deps: SettingsDeps): unknown {
       // ── connection ────────────────────────────────────────────────────
       h('div', { className: 'weknora-group' },
         h('div', { className: 'gh' }, t('settings.group.connection')),
-        row(t('settings.field.baseUrl'), input('baseUrl', { className: 'weknora-input is-mono', placeholder: 'https://weknora.example.com', disabled: !writable }), t('settings.field.baseUrlHint'), ['baseUrl']),
+        row(t('settings.field.baseUrl'), input('baseUrl', { className: 'weknora-input is-mono', placeholder: 'https://weknora.example.com', disabled: !writable }), addressEdited ? t('settings.field.baseUrlUnsaved') : t('settings.field.baseUrlHint'), ['baseUrl']),
         row(t('settings.field.status'), h('div', { className: 'weknora-status' },
-          h('span', { className: 'ok' }),
-          h('span', null, status?.knowledgeBaseCount === undefined
-            ? t('settings.status.unknown')
-            : t('settings.status.bases', { n: status.knowledgeBaseCount })),
+          h('span', { className: connection.state }),
+          h('span', null, connection.text),
           h('span', { className: 'weknora-spacer' }),
-          h('button', { type: 'button', className: 'weknora-btn', disabled: busy, onClick: () => void test() },
-            busy ? t('settings.testing') : t('settings.test'))))),
+          h('button', {
+            type: 'button',
+            className: 'weknora-btn',
+            disabled: busy,
+            onClick: () => { void (addressEdited ? saveThenTest() : test()) },
+          },
+            busy ? t('settings.testing') : addressEdited ? t('settings.test.saveAndTest') : t('settings.test')))),
+          connection.reason),
 
       // ── auth ──────────────────────────────────────────────────────────
       h('div', { className: 'weknora-group' },

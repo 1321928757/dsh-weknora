@@ -82,6 +82,10 @@ export class KnowledgeBaseCatalog {
       seen.add(entry.id)
       entries.push(entry)
     }
+    // A response we can read is proof the backend answered, so a failure recorded
+    // earlier (a refused boot-time warm-up) must not survive it: the status row
+    // would keep saying "not connected" right after a passing test.
+    this.lastErrorText = undefined
     this.commit(entries)
     return entries
   }
