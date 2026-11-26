@@ -1,0 +1,26 @@
+# Build output and dependencies: installed, never committed.
+node_modules/
+dist/
+*.tgz
+
+# Local working files.
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+.env
+.env.*
+
+# Internal working material: not part of the plugin.
+openspec/
+.research/
+.agents/
+
+# Internal design notes and review records. The surface guide is the one piece
+# of docs/ that a plugin author outside this project can use, so it ships.
+docs/*
+!docs/dsh-menu-surface-guide.md
+!docs/
+
+# Probes the DSH desktop app's own bundle; machine-specific, not for publishing.
+scripts/scan-asar.mjs
